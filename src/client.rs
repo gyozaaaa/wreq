@@ -151,7 +151,12 @@ type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
 ///
 /// [`Rc`]: std::rc::Rc
 #[derive(Clone)]
-pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
+pub struct Client(
+    Arc<Either<ClientService, BoxedClientService>>,
+    // the innermost service, sharing the stack's connection pool, for
+    // `preconnect`
+    HttpClient<Connector, Body>,
+);
 
 /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
 #[must_use]
@@ -430,6 +435,30 @@ impl Client {
             fut: Box::pin(Oneshot::new((*self.0).clone(), req)),
         }
     }
+
+    /// Opens a connection to the origin of `uri` without sending anything on
+    /// it, and leaves it idle in the pool for the next request there.
+    ///
+    /// The connection is made the way a request to `uri` would make it:
+    /// through the same proxy, with the same TLS and HTTP/2 settings, so the
+    /// handshake is the one that request would have done. Only a request with
+    /// no per-request proxy, version, TLS or socket options uses it.
+    ///
+    /// Each call opens a new connection, whether or not one is already idle.
+    /// Nothing but the connect timeout bounds it, as there is no request for
+    /// the client's request timeout to apply to.
+    ///
+    /// # Errors
+    ///
+    /// This fails when `uri` cannot be parsed or the connection cannot be
+    /// made, with the error the request would have failed with.
+    pub fn preconnect<U: IntoUri>(
+        &self,
+        uri: U,
+    ) -> impl Future<Output = crate::Result<()>> + Send + 'static {
+        let connect = uri.into_uri().map(|uri| self.1.preconnect(uri));
+        async move { connect?.await.map_err(Error::request) }
+    }
 }
 
 impl tower::Service<Request> for Client {
@@ -585,6 +614,8 @@ impl ClientBuilder {
                 .build(connector)
         };
 
+        let http_client = service.clone();
+
         // Configured client service with layers
         let client = {
             let service = ServiceBuilder::new()
@@ -638,7 +669,7 @@ impl ClientBuilder {
             }
         };
 
-        Ok(Client(Arc::new(client)))
+        Ok(Client(Arc::new(client), http_client))
     }
 
     // Runtime options

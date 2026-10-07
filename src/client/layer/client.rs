@@ -368,6 +368,41 @@ where
         Ok(res)
     }
 
+    /// Open a connection to `uri`'s origin the way a request to it with no
+    /// per-request options would, and leave it idle in the pool, where the
+    /// next such request checks it out.
+    pub(crate) fn preconnect(
+        &self,
+        uri: Uri,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'static {
+        let mut req = Request::new(());
+        *req.uri_mut() = uri;
+        // the pool key `request` would build: the origin, and the default
+        // per-request options
+        let connect = normalize_uri(&mut req, false).map(|uri| {
+            let RequestOptions {
+                group,
+                proxy,
+                version,
+                tls_options,
+                socket_bind_options,
+                ..
+            } = RequestOptions::default();
+            self.connect_to(ConnectionDescriptor::new(
+                uri,
+                group,
+                proxy,
+                version,
+                tls_options,
+                socket_bind_options,
+            ))
+        });
+        async move {
+            // dropping the connection is what puts it in the pool
+            connect?.await.map(drop)
+        }
+    }
+
     async fn connection_for(
         &self,
         descriptor: ConnectionDescriptor,
